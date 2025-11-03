@@ -8,33 +8,27 @@ import pandas as pd
 
 import xarray as xr
 import rioxarray as rxr
+from shapely.geometry import box as shapely_box
 
 # Data acquisition
 import py3dep
 
 import fiona
 from scipy import ndimage as ndi
+import richdem as rd
+from pyproj import CRS as _CRS
 
-# Robust imports across pynhd versions
-try:
-    from pynhd import WBD
-except Exception:  # Some versions don't export WBD
-    WBD = None
-try:
-    from pynhd import NHD
-except Exception:
-    NHD = None
-try:
-    from pynhd import WaterData
-except Exception:
-    WaterData = None
+# Pynhd imports (local version: NHD and WaterData are available; no WBD class)
+from pynhd import NHD, WaterData
 
 # Rasterization and transforms
 from rasterio import features
+from rasterio.io import MemoryFile
+from rasterio.merge import merge as rio_merge
+from affine import Affine
 
 # Zonal statistics
 from rasterstats import zonal_stats
-
 
 LOGGER = logging.getLogger("handy.core")
 
@@ -48,9 +42,8 @@ def ensure_dir(path):
         os.makedirs(path)
 
 
-def get_huc10_boundary(huc10):
-    """
-    Fetch HUC-10 boundary polygon using USGS WBD via pynhd.
+def get_huc10_boundary(huc10: str) -> gpd.GeoDataFrame:
+    """Fetch HUC-10 boundary polygon using WaterData WBD10 via pynhd.
 
     Parameters
     ----------
@@ -60,100 +53,20 @@ def get_huc10_boundary(huc10):
     Returns
     -------
     geopandas.GeoDataFrame
-        Boundary as a single-row GeoDataFrame in its native CRS.
+        Single-row GeoDataFrame for the requested HUC-10.
     """
-    LOGGER.info("Fetching WBD boundary for HUC-10 %s", huc10)
-
-    gdf = None
-    err = None
-
-    # Preferred: dedicated WBD class if available
-    if WBD is not None:
-        try:
-            wbd = WBD("huc10")
-            LOGGER.debug("Using pynhd.WBD('huc10') for HUC boundary")
-            try:
-                gdf = wbd.byids("huc10", [huc10])
-            except Exception:
-                gdf = wbd.byids(ids=[huc10])
-        except Exception as e:
-            err = e
-
-    # Fallback A: WaterData("wbd") with layer name variants seen in servers
-    if (gdf is None or len(gdf) == 0) and WaterData is not None:
-        try:
-            LOGGER.debug("Using pynhd.WaterData('wbd') with layer fallback for HUC boundary")
-            wd = WaterData("wbd")
-            # Valid options (from your environment): wbd10, wbd12, etc.
-            for layer_name in [
-                "wbd10",
-                "wbdhu10",
-                "huc10",
-            ]:
-                try:
-                    gtmp = wd.byid(layer=layer_name, ids=[huc10])
-                    if gtmp is not None and len(gtmp) > 0:
-                        gdf = gtmp
-                        break
-                except Exception:
-                    try:
-                        gtmp = wd.byids(layer=layer_name, ids=[huc10])
-                        if gtmp is not None and len(gtmp) > 0:
-                            gdf = gtmp
-                            break
-                    except Exception:
-                        pass
-        except Exception as e:
-            err = e
-
-    # Fallback B: Direct dataset per-layer WaterData("wbd10")
-    if (gdf is None or len(gdf) == 0) and WaterData is not None:
-        try:
-            LOGGER.debug("Using pynhd.WaterData('wbd10') direct for HUC boundary")
-            wd10 = WaterData("wbd10")
-            # Try a variety of signatures
-            tried_err = None
-            for call in (
-                lambda: wd10.byid(id=huc10),
-                lambda: wd10.byid(huc10),
-                lambda: wd10.byid(ids=[huc10]),
-                lambda: wd10.byids(ids=[huc10]),
-                lambda: wd10.byids([huc10]),
-            ):
-                try:
-                    gtmp = call()
-                    if gtmp is not None and len(gtmp) > 0:
-                        gdf = gtmp
-                        break
-                except Exception as ce:
-                    tried_err = ce
-            if gdf is None or len(gdf) == 0:
-                err = tried_err
-        except Exception as e:
-            err = e
-
-    if gdf is None or len(gdf) == 0:
-        raise RuntimeError(
-            "Failed to fetch HUC-10 boundary for %s via pynhd (WBD/WaterData); last error: %s"
-            % (huc10, str(err))
-        )
-
-    # Some versions return multiple features; filter exact match if the field exists
-    huc_col = None
-    for col in gdf.columns:
-        if str(col).lower() == "huc10":
-            huc_col = col
-            break
-    if huc_col is not None:
-        gdf = gdf[gdf[huc_col].astype(str) == str(huc10)].copy()
-    gdf = gdf.reset_index(drop=True)
-    if len(gdf) == 0:
-        raise RuntimeError("WBD did not return the requested HUC-10 polygon.")
-
-    return gdf
+    LOGGER.info("Fetching WBD10 boundary for HUC-10 %s", huc10)
+    wd = WaterData("wbd10")
+    gdf = wd.byid("huc10", str(huc10))
+    # Ensure exact match and canonicalize index
+    if "huc10" in [c.lower() for c in gdf.columns]:
+        # Find actual column name case
+        col = next(c for c in gdf.columns if c.lower() == "huc10")
+        gdf = gdf[gdf[col].astype(str) == str(huc10)]
+    return gdf.reset_index(drop=True)
 
 
-def get_flowlines_within_aoi(aoi_gdf):
+def get_flowlines_within_aoi(aoi_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Fetch NHDPlus flowlines intersecting the AOI using pynhd.
 
@@ -168,42 +81,13 @@ def get_flowlines_within_aoi(aoi_gdf):
         Flowlines clipped to AOI (in the service/native CRS). Caller should reproject to target raster CRS.
     """
     LOGGER.info("Fetching NHDPlus flowlines within AOI")
-    fl = None
-    err = None
-
-    # Preferred: NHD class if available
-    if NHD is not None:
-        try:
-            nhd = NHD("flowline")
-            geom = aoi_gdf.geometry.unary_union
-            try:
-                fl = nhd.bygeom(geom, spatial_rel="intersects")
-            except Exception:
-                fl = nhd.bygeom(geom)
-        except Exception as e:
-            err = e
-
-    # Fallback: WaterData with flowline network dataset
-    if (fl is None or len(fl) == 0) and WaterData is not None:
-        try:
-            wd = WaterData("nhdflowline_network")
-            geom = aoi_gdf.geometry.unary_union
-            try:
-                fl = wd.bygeom(geom, spatial_rel="intersects")
-            except Exception:
-                fl = wd.bygeom(geom)
-        except Exception as e:
-            err = e
-    if fl is None or len(fl) == 0:
-        raise RuntimeError(
-            "Failed to fetch NHDPlus flowlines; last error: %s" % str(err)
-        )
+    # Use NHD high-resolution flowlines and intersect by geometry in WGS84
+    geom = aoi_gdf.to_crs(4326).geometry.unary_union
+    nhd = NHD("flowline_hr")
+    fl = nhd.bygeom(geom, geo_crs=4326)
 
     # Clip to AOI explicitly to be safe
-    try:
-        fl = gpd.clip(fl, aoi_gdf)
-    except Exception:
-        fl = gpd.overlay(fl, aoi_gdf, how="intersection")
+    fl = gpd.clip(fl, aoi_gdf)
 
     fl = fl.reset_index(drop=True)
     return fl
@@ -235,8 +119,7 @@ def _filter_flowlines_nhd(fl, natural_perennial=False, exclude_artificial=False)
         if fcode_col is not None:
             df = df[df[fcode_col] == 46006]
         elif ftype_col is not None:
-            df = df[df[ftype_col].astype(str).str.lower().isin(["streamriver")]  # likely error: does not guarantee perennial specifically
-        ]
+            df = df[df[ftype_col].astype(str).str.lower().isin(["streamriver"])]
 
     if exclude_artificial and ftype_col is not None:
         drop_types = {"artificialpath", "canalditch"}
@@ -245,7 +128,14 @@ def _filter_flowlines_nhd(fl, natural_perennial=False, exclude_artificial=False)
     return df.reset_index(drop=True)
 
 
-def get_dem_for_aoi(aoi_gdf, target_crs_epsg=5070, resolution=10):
+def get_dem_for_aoi(
+    aoi_gdf,
+    target_crs_epsg=5070,
+    resolution=1,
+    cache_path=None,
+    overwrite=False,
+    tile_max_px=4096,
+):
     """
     Download USGS 3DEP DEM for the AOI using py3dep.
 
@@ -271,52 +161,115 @@ def get_dem_for_aoi(aoi_gdf, target_crs_epsg=5070, resolution=10):
         DEM with rioxarray CRS/transform set (in target_crs_epsg), masked to AOI extent.
     """
     LOGGER.info(
-        "Requesting 3DEP DEM at ~%sm resolution in EPSG:%s", resolution, target_crs_epsg
+        "Requesting 3DEP DEM at ~%sm (LiDAR where available) in EPSG:%s",
+        resolution,
+        target_crs_epsg,
     )
 
     target_crs = f"EPSG:{int(target_crs_epsg)}"
 
-    # Use a WGS84 bbox as a robust input, request output in target_crs
-    aoi_wgs84 = aoi_gdf.to_crs("EPSG:4326")
-    bbox_wgs84 = tuple(aoi_wgs84.total_bounds.tolist())
+    # Cached DEM
+    if cache_path and (not overwrite) and os.path.exists(cache_path):
+        LOGGER.info("Loading cached DEM: %s", cache_path)
+        dem_cached = rxr.open_rasterio(cache_path)
+        if "band" in dem_cached.dims:
+            dem_cached = dem_cached.squeeze("band", drop=True)
+        return dem_cached
 
-    dem = None
-    err = None
-    # Try the newer get_dem signature first
-    try:
-        dem = py3dep.get_dem(
-            bbox=bbox_wgs84, resolution=resolution, crs=target_crs, align=True
-        )
-    except Exception as e:
-        err = e
+    # Tiling in projected CRS to limit max pixels per request
+    aoi_proj = aoi_gdf.to_crs(target_crs)
+    minx, miny, maxx, maxy = aoi_proj.total_bounds.tolist()
+
+    width_m = maxx - minx
+    height_m = maxy - miny
+    tile_px = int(tile_max_px)
+    nx = max(1, int(np.ceil((width_m / float(resolution)) / float(tile_px))))
+    ny = max(1, int(np.ceil((height_m / float(resolution)) / float(tile_px))))
+    dx = width_m / float(nx)
+    dy = height_m / float(ny)
+
+    tiles = []
+    for ix in range(nx):
+        for iy in range(ny):
+            x0 = minx + ix * dx
+            x1 = minx + (ix + 1) * dx
+            y0 = miny + iy * dy
+            y1 = miny + (iy + 1) * dy
+            tiles.append((x0, y0, x1, y1))
+
+    parts = []
+    for (x0, y0, x1, y1) in tiles:
+        geom = (x0, y0, x1, y1)
+        da = py3dep.get_dem(geom, int(resolution), crs=int(target_crs_epsg))
+        # Squeeze band if present
+        if "band" in da.dims:
+            da = da.squeeze("band", drop=True)
+        # Ensure merge-friendly orientation (positive pixel height)
+        tr = da.rio.transform()
+        if tr.e < 0:
+            h = da.sizes["y"]
+            # flip along y dimension
+            da = da.isel(y=slice(None, None, -1))
+            new_tr = Affine(tr.a, tr.b, tr.c, tr.d, -tr.e, tr.f + tr.e * (h - 1))
+            da = da.rio.write_transform(new_tr)
+        parts.append(da)
+
+    # Mosaic tiles using rasterio.merge with in-memory GTiffs to avoid
+    # orientation issues during merge.
+
+    srcs = []
+    mems = []
+    for da in parts:
+        arr = np.asarray(da.data).astype("float32")
+        tr = da.rio.transform()
+        crs = da.rio.crs
+        profile = {
+            "driver": "GTiff",
+            "height": arr.shape[-2],
+            "width": arr.shape[-1],
+            "count": 1,
+            "dtype": "float32",
+            "crs": crs,
+            "transform": tr,
+            # Do not set nodata to NaN; leave undefined so merge treats NaNs as data mask
+        }
+        mem = MemoryFile()
+        mems.append(mem)
+        ds = mem.open(**profile)
+        ds.write(arr, 1)
+        srcs.append(ds)
+
+    mosaic, mosaic_tr = rio_merge(srcs)
+    # Close datasets but keep MemoryFiles alive until after DataArray creation
+    for ds in srcs:
         try:
-            # Fallback via get_map API
-            dem = py3dep.get_map(
-                "elevation", bbox_wgs84, resolution=resolution, crs=target_crs, to_raster=True
-            )
-        except Exception as e2:
-            err = e2
+            ds.close()
+        except Exception:
+            pass
 
-    if dem is None:
-        raise RuntimeError(
-            "Failed to fetch DEM from 3DEP via py3dep; last error: %s" % str(err)
-        )
-
-    # Ensure DataArray has a CRS and transform; py3dep provides them via rioxarray
-    dem = dem.rio.write_crs(target_crs, inplace=False)
+    dem = xr.DataArray(
+        mosaic[0],
+        dims=("y", "x"),
+        name="elevation",
+    )
+    dem = dem.rio.write_crs(parts[0].rio.crs, inplace=False)
+    dem = dem.rio.write_transform(mosaic_tr)
+    if str(dem.rio.crs) != target_crs:
+        dem = dem.rio.reproject(target_crs)
 
     # Optionally clip to AOI footprint to minimize downstream computation
-    try:
-        dem = dem.rio.clip(aoi_gdf.to_crs(target_crs).geometry, aoi_gdf.to_crs(target_crs).crs)
-    except Exception:
-        # If rioxarray clip fails (non-overlapping bounds tolerance), skip exact clip and rely on bbox
-        pass
+    dem = dem.rio.clip(aoi_gdf.to_crs(target_crs).geometry, aoi_gdf.to_crs(target_crs).crs)
+
+    # Save cache if requested
+    if cache_path:
+        ensure_dir(os.path.dirname(cache_path))
+        LOGGER.info("Saving DEM cache: %s", cache_path)
+        dem.rio.to_raster(cache_path)
 
     # Chunk for scalable computation; values are tuned for typical HUC-10 scale
     try:
         dem = dem.chunk({"y": 2048, "x": 2048})
     except Exception:
-        # If chunking unsupported, proceed un-chunked
         pass
 
     return dem
@@ -371,58 +324,35 @@ def fill_sinks(dem_da):
     """
     Hydro-condition the DEM by filling depressions using richdem.
 
-    Notes:
-    - richdem expects an in-memory array (RDArray). For typical HUC-10 areas at
-      10 m resolution this is feasible; we compute the DataArray to NumPy.
-    - Nodata handling: we propagate nodata as NaN after filling.
+    This version uses the local RichDEM Python API directly with no fallbacks
+    or exception handling so errors surface clearly.
     """
     LOGGER.info("Filling depressions (hydro-conditioning DEM via richdem)")
 
-    try:
-        import richdem as rd
-    except Exception as e:
-        raise RuntimeError(
-            "richdem is required for depression filling; please install richdem"
-        ) from e
-
+    # Materialize DEM to NumPy and cast to float32 (RichDEM supported type)
     data = dem_da.data
-    # Compute to NumPy if dask-backed
-    try:
-        dem_np = data.compute() if hasattr(data, "compute") else np.asarray(data)
-    except Exception:
-        dem_np = np.asarray(dem_da.values)
+    dem_np = data.compute() if hasattr(data, "compute") else np.asarray(data)
+    dem_np = dem_np.astype("float32", copy=False)
 
-    # Prepare nodata
+    # Build rdarray with an explicit no_data, and supply geotransform
     nd = dem_da.rio.nodata
-    mask_valid = np.isfinite(dem_np) if nd is None else (dem_np != nd)
-    rd_nd = -999999.0
-    dem_in = np.where(mask_valid, dem_np, rd_nd)
+    if nd is None or not np.isfinite(nd):
+        nd = -9999.0
+    # Replace NaNs with nd for RichDEM
+    dem_in = np.where(np.isfinite(dem_np), dem_np, nd).astype("float32", copy=False)
 
-    dem_rd = rd.rdarray(dem_in, no_data=rd_nd)
+    # Construct geotransform from rasterio Affine
+    gt = dem_da.rio.transform()
+    geotransform = [gt.c, gt.a, gt.b, gt.f, gt.d, gt.e]
 
-    filled_rd = None
-    err = None
-    # Try common richdem APIs defensively across versions
-    try:
-        filled_rd = rd.FillDepressions(dem_rd, epsilon=True)
-    except Exception as e1:
-        err = e1
-        try:
-            filled_rd = rd.FillDepressions(dem_rd, in_place=False)
-        except Exception as e2:
-            err = e2
-            try:
-                filled_rd = rd.fill_depressions(dem_rd)
-            except Exception as e3:
-                err = e3
-    if filled_rd is None:
-        raise RuntimeError(
-            "Failed to fill depressions with richdem; last error: %s" % str(err)
-        )
+    dem_rd = rd.rdarray(dem_in, no_data=float(nd), geotransform=geotransform)
 
-    filled_np = np.array(filled_rd)
-    # Restore nodata as NaN for downstream xarray/rioxarray friendliness
-    filled_np = np.where(mask_valid, filled_np, np.nan)
+    # Fill depressions with epsilon gradient to avoid flats
+    filled_rd = rd.FillDepressions(dem_rd, epsilon=True, in_place=False, topology="D8")
+
+    filled_np = np.asarray(filled_rd, dtype="float32")
+    # Restore nodata to NaN for downstream processing
+    filled_np = np.where(filled_np == float(nd), np.nan, filled_np)
 
     filled_da = xr.DataArray(
         filled_np,
@@ -473,13 +403,6 @@ def compute_rem_from_streams(dem_da, streams_da):
 
     if streams_np.sum() == 0:
         raise ValueError("Stream mask has no active cells after rasterization.")
-
-    try:
-        from scipy import ndimage as ndi
-    except Exception as e:
-        raise RuntimeError(
-            "scipy is required for nearest-neighbor elevation sampling; install scipy"
-        ) from e
 
     # Compute indices of nearest stream cell for each pixel
     # distance_transform_edt on ~stream cells returns indices to the nearest True
@@ -680,8 +603,18 @@ def compute_field_rem_stats(fields_gdf, rem_da, stats=("mean",)):
     """
     LOGGER.info("Computing zonal statistics over fields (stats: %s)", ",".join(stats))
 
-    if str(fields_gdf.crs) != str(rem_da.rio.crs):
-        raise ValueError("Fields CRS and REM CRS must match before zonal stats.")
+    # Ensure CRS consistency; reproject fields to REM CRS if needed.
+    rem_crs = rem_da.rio.crs
+    if rem_crs is None:
+        raise ValueError("REM raster has no CRS; cannot compute zonal stats.")
+    if fields_gdf.crs is None:
+        raise ValueError("Fields GeoDataFrame has no CRS; cannot compute zonal stats.")
+    try:
+        if not _CRS.from_user_input(fields_gdf.crs).equals(_CRS.from_user_input(rem_crs)):
+            fields_gdf = fields_gdf.to_crs(rem_crs)
+    except Exception:
+        if str(fields_gdf.crs) != str(rem_crs):
+            fields_gdf = fields_gdf.to_crs(rem_crs)
 
     affine = rem_da.rio.transform()
     raster = np.asarray(rem_da.data)
@@ -729,14 +662,16 @@ def stratify_fields_by_rem(fields_with_stats_gdf, threshold_m=2.0):
 
 
 def run_hand_stratification(huc10, fields_path, out_dir,
-                            dem_resolution=10, rem_threshold=2.0,
+                            dem_resolution=1, rem_threshold=2.0,
                             save_rem=True,
                             natural_perennial=True, exclude_artificial=False,
                             rem_method="nearest",
                             centerline_spacing_m=250.0,
                             buffer_exclude_m=50.0,
                             smooth_sigma_m=150.0,
-                            save_intermediates=False):
+                            save_intermediates=False,
+                            overwrite_dem=False,
+                            dem_tile_max_px=4096):
     """
     Orchestrate REM/HAND computation and field stratification over a HUC-10.
 
@@ -760,10 +695,19 @@ def run_hand_stratification(huc10, fields_path, out_dir,
     # 2) Flowlines
     flowlines = get_flowlines_within_aoi(aoi)
     if natural_perennial or exclude_artificial:
-        flowlines = _filter_flowlines_nhd(flowlines, natural_perennial=natural_perennial, exclude_artificial=exclude_artificial)
+        flowlines = _filter_flowlines_nhd(flowlines, natural_perennial=natural_perennial,
+                                          exclude_artificial=exclude_artificial)
 
     # 3) DEM
-    dem = get_dem_for_aoi(aoi, target_crs_epsg=5070, resolution=dem_resolution)
+    dem_cache = os.path.join(out_dir, f"dem_huc10_{huc10}_{int(dem_resolution)}m.tif")
+    dem = get_dem_for_aoi(
+        aoi,
+        target_crs_epsg=5070,
+        resolution=dem_resolution,
+        cache_path=dem_cache,
+        overwrite=overwrite_dem,
+        tile_max_px=int(dem_tile_max_px),
+    )
     dem_crs = dem.rio.crs
 
     # 4) Reproject AOI + flowlines to DEM CRS and rasterize streams
