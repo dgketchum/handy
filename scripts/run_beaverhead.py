@@ -51,8 +51,19 @@ def parse_args():
     parser.add_argument(
         "--dem-resolution",
         type=float,
-        default=10.0,
-        help="Target DEM resolution in meters (default: 10)",
+        default=1.0,
+        help="Target DEM resolution in meters (LiDAR if available; default: 1)",
+    )
+    parser.add_argument(
+        "--dem-tile-max-px",
+        type=int,
+        default=4096,
+        help="Max tile dimension in pixels for DEM requests (default: 4096)",
+    )
+    parser.add_argument(
+        "--overwrite-dem",
+        action="store_true",
+        help="Overwrite cached DEM if it exists",
     )
     parser.add_argument(
         "-v",
@@ -69,8 +80,8 @@ def main():
     add_src_to_path()
 
     # Deferred import after path setup
-    from handy.core import run_hand_stratification, ensure_dir, LOGGER as CORE_LOGGER
-    from handy.viz import write_interactive_map
+    from src.handy.core import run_hand_stratification, ensure_dir, LOGGER as CORE_LOGGER
+    from src.handy.viz import write_interactive_map
 
     # Make and log output directory
     ensure_dir(args.out_dir)
@@ -85,6 +96,8 @@ def main():
         dem_resolution=float(args.dem_resolution),
         rem_threshold=float(args.rem_threshold),
         save_rem=True,
+        overwrite_dem=bool(args.overwrite_dem),
+        dem_tile_max_px=int(args.dem_tile_max_px),
     )
 
     # Write interactive debug map with basemap switch and REM/DEM overlays
