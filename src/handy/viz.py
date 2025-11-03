@@ -10,7 +10,6 @@ import rasterio
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject, Resampling
 
-
 LOGGER = logging.getLogger("handy.viz")
 
 
@@ -99,7 +98,7 @@ def write_interactive_map(results, out_html, initial_threshold=2.0):
     .legend .swatch {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: middle; }}
   </style>
   <base target=\"_self\">
-  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' https://unpkg.com https://{\{s\}}.tile.openstreetmap.org; style-src 'self' 'unsafe-inline' https://unpkg.com;\" />
+  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self' https://unpkg.com https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline' https://unpkg.com;\" />
   <!-- CSP keeps things tidy while allowing Leaflet and OSM tiles. -->
 </head>
 <body>
@@ -151,6 +150,10 @@ def write_interactive_map(results, out_html, initial_threshold=2.0):
     const thr = document.getElementById('thr');
     const thrval = document.getElementById('thrval');
     const counts = document.getElementById('counts');
+    const remRampSel = document.getElementById('remRamp');
+    const demRampSel = document.getElementById('demRamp');
+    const toggleRem = document.getElementById('toggleRem');
+    const toggleDem = document.getElementById('toggleDem');
 
     function styleForFeature(f, t) {{
       const m = f.properties && typeof f.properties.rem_mean === 'number' ? f.properties.rem_mean : null;
@@ -193,6 +196,31 @@ def write_interactive_map(results, out_html, initial_threshold=2.0):
     }}
 
     thr.addEventListener('input', refresh);
+
+    // Tile layers baked from REM/DEM (injected from Python)
+{rem_tiles_js}
+{dem_tiles_js}
+
+    let activeRem = null;
+    let activeDem = null;
+
+    function setRemLayer(name) {{
+      if (typeof remLayers === 'undefined' || !remLayers[name]) return;
+      if (activeRem) {{ try {{ map.removeLayer(activeRem); }} catch(e) {{}} }}
+      activeRem = remLayers[name];
+      if (toggleRem.checked) activeRem.addTo(map);
+    }}
+    function setDemLayer(name) {{
+      if (typeof demLayers === 'undefined' || !demLayers[name]) return;
+      if (activeDem) {{ try {{ map.removeLayer(activeDem); }} catch(e) {{}} }}
+      activeDem = demLayers[name];
+      if (toggleDem.checked) activeDem.addTo(map);
+    }}
+
+    remRampSel.addEventListener('change', () => setRemLayer(remRampSel.value));
+    demRampSel.addEventListener('change', () => setDemLayer(demRampSel.value));
+    toggleRem.addEventListener('change', () => {{ if (activeRem) {{ if (toggleRem.checked) activeRem.addTo(map); else map.removeLayer(activeRem); }} }});
+    toggleDem.addEventListener('change', () => {{ if (activeDem) {{ if (toggleDem.checked) activeDem.addTo(map); else map.removeLayer(activeDem); }} }});
 
     // Fit map to AOI or fields
     let fitBounds = null;
@@ -330,8 +358,8 @@ def _colormap_linear(arr, vmin, vmax, scheme="blue-red", mask=None):
 
     if scheme == "blue-red":
         stops = [
-            (0.0, (44, 123, 182)),   # #2c7bb6
-            (1.0, (215, 25, 28)),    # #d7191c
+            (0.0, (44, 123, 182)),  # #2c7bb6
+            (1.0, (215, 25, 28)),  # #d7191c
         ]
         alpha_val = 200.0
     elif scheme == "grayscale":
@@ -340,18 +368,18 @@ def _colormap_linear(arr, vmin, vmax, scheme="blue-red", mask=None):
         alpha_val = 180.0
     elif scheme == "terrain":
         stops = [
-            (0.0, (26, 102, 26)),    # dark green
+            (0.0, (26, 102, 26)),  # dark green
             (0.35, (190, 190, 60)),  # yellowish
-            (0.7, (160, 82, 45)),    # brown
+            (0.7, (160, 82, 45)),  # brown
             (1.0, (245, 245, 245)),  # near white
         ]
         alpha_val = 180.0
     elif scheme == "viridis":
         stops = [
-            (0.0, (68, 1, 84)),      # #440154
+            (0.0, (68, 1, 84)),  # #440154
             (0.33, (49, 104, 142)),  # #31688e
             (0.66, (53, 183, 121)),  # #35b779
-            (1.0, (253, 231, 37)),   # #fde725
+            (1.0, (253, 231, 37)),  # #fde725
         ]
         alpha_val = 180.0
     else:
@@ -421,9 +449,11 @@ def _lonlat_bounds_from_tile(z, x, y):
     n = float(1 << int(z))
     lon_w = x / n * 360.0 - 180.0
     lon_e = (x + 1.0) / n * 360.0 - 180.0
+
     def lat_from_y(ty):
         t = math.pi * (1.0 - 2.0 * (ty / n))
         return math.degrees(math.atan(math.sinh(t)))
+
     lat_n = lat_from_y(float(y))
     lat_s = lat_from_y(float(y + 1))
     return lon_w, lat_s, lon_e, lat_n
@@ -458,11 +488,13 @@ def _bake_xyz_tiles(da, out_root, mode, schemes, zmin=9, zmax=14):
         x1 = int(math.floor((lonmax + 180.0) / 360.0 * n))
         x0 = max(0, min(n - 1, x0))
         x1 = max(0, min(n - 1, x1))
+
         # y range (note: y increases southward)
         def y_from_lat(lat):
             lat = max(-85.05112878, min(85.05112878, float(lat)))
             lat_rad = math.radians(lat)
             return int(math.floor((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n))
+
         y0 = y_from_lat(latmax)
         y1 = y_from_lat(latmin)
         y0 = max(0, min(n - 1, y0))
@@ -507,33 +539,4 @@ def _bake_xyz_tiles(da, out_root, mode, schemes, zmin=9, zmax=14):
                         dst_img.write(rgba[2], 3)
                         dst_img.write(rgba[3], 4)
 
-
 # EOF
-    // Tile layers baked from REM/DEM
-{rem_tiles_js}
-{dem_tiles_js}
-
-    let activeRem = null;
-    let activeDem = null;
-    const remRampSel = document.getElementById('remRamp');
-    const demRampSel = document.getElementById('demRamp');
-    const toggleRem = document.getElementById('toggleRem');
-    const toggleDem = document.getElementById('toggleDem');
-
-    function setRemLayer(name) {{
-      if (!remLayers || !remLayers[name]) return;
-      if (activeRem) {{ try {{ map.removeLayer(activeRem); }} catch(e) {{}} }}
-      activeRem = remLayers[name];
-      if (toggleRem.checked) activeRem.addTo(map);
-    }}
-    function setDemLayer(name) {{
-      if (!demLayers || !demLayers[name]) return;
-      if (activeDem) {{ try {{ map.removeLayer(activeDem); }} catch(e) {{}} }}
-      activeDem = demLayers[name];
-      if (toggleDem.checked) activeDem.addTo(map);
-    }}
-
-    remRampSel.addEventListener('change', () => setRemLayer(remRampSel.value));
-    demRampSel.addEventListener('change', () => setDemLayer(demRampSel.value));
-    toggleRem.addEventListener('change', () => {{ if (activeRem) {{ if (toggleRem.checked) activeRem.addTo(map); else map.removeLayer(activeRem); }} }});
-    toggleDem.addEventListener('change', () => {{ if (activeDem) {{ if (toggleDem.checked) activeDem.addTo(map); else map.removeLayer(activeDem); }} }});
